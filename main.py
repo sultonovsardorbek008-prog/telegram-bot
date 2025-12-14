@@ -2,108 +2,161 @@ import os
 import logging
 import sqlite3
 import datetime
+import asyncio
 from aiogram import Bot, Dispatcher, types, F
-from aiogram.filters import Command
+from aiogram.filters import Command, CommandStart, CommandObject
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import (ReplyKeyboardMarkup, KeyboardButton, 
-                           InlineKeyboardMarkup, InlineKeyboardButton, ReplyKeyboardRemove)
+                           InlineKeyboardMarkup, InlineKeyboardButton, ReplyKeyboardRemove, FSInputFile)
 
-# --- KONFIGURATSIYA (SOZLAMALAR) ---
-# --- KONFIGURATSIYA (ENV ORQALI) ---
+# --- KONFIGURATSIYA ---
 API_TOKEN = os.getenv("BOT_TOKEN")
 ADMIN_ID = int(os.getenv("ADMIN_ID"))
-
-DB_NAME = os.getenv("DB_NAME", "bot_database_v4_pro.db")
+DB_NAME = os.getenv("DB_NAME", "bot_database_v5_ultimate.db")
 
 CURRENCY_NAME = os.getenv("CURRENCY_NAME", "SULTANCOIN")
 CURRENCY_SYMBOL = os.getenv("CURRENCY_SYMBOL", "SC")
 
-CARD_UZS = os.getenv("CARD_UZS")
-CARD_NAME = os.getenv("CARD_NAME")
-CARD_VISA = os.getenv("CARD_VISA")
+# Karta ma'lumotlari
+CARD_UZS = os.getenv("CARD_UZS", "0000 0000 0000 0000")
+CARD_NAME = os.getenv("CARD_NAME", "Ism Familiya")
+CARD_VISA = os.getenv("CARD_VISA", "4000 0000 0000 0000")
 
 logging.basicConfig(level=logging.INFO)
 bot = Bot(token=API_TOKEN)
 dp = Dispatcher()
 
-# --- BAZA BILAN ISHLASH UCHUN XAVFSIZ YORDAMCHI FUNKSIYA ---
-# Bu funksiya har safar bazaga yangi ulanish ochadi va yopadi.
-# Bu global kursor muammosini hal qiladi.
+# --- BAZA BILAN ISHLASH ---
 def db_query(query, params=(), fetchone=False, fetchall=False, commit=False):
     try:
         with sqlite3.connect(DB_NAME) as conn:
             cursor = conn.cursor()
             cursor.execute(query, params)
-            
-            if commit:
-                conn.commit()
-                
-            if fetchone:
-                return cursor.fetchone()
-            if fetchall:
-                return cursor.fetchall()
+            if commit: conn.commit()
+            if fetchone: return cursor.fetchone()
+            if fetchall: return cursor.fetchall()
             return None
     except Exception as e:
         print(f"Bazada xatolik: {e}")
         return None
 
-# --- BAZANI YARATISH ---
 def init_db():
     with sqlite3.connect(DB_NAME) as conn:
         cursor = conn.cursor()
+        # Users jadvali: balance REAL (float) ga o'zgardi, status_level qo'shildi
         cursor.execute('''CREATE TABLE IF NOT EXISTS users 
                           (id INTEGER PRIMARY KEY, 
-                           balance INTEGER DEFAULT 0,
-                           is_pro INTEGER DEFAULT 0,
-                           pro_expire_date TEXT)''')
+                           balance REAL DEFAULT 0.0,
+                           status_level INTEGER DEFAULT 0,
+                           status_expire TEXT,
+                           referrer_id INTEGER)''')
 
         cursor.execute('''CREATE TABLE IF NOT EXISTS config 
                           (key TEXT PRIMARY KEY, value TEXT)''')
-
+        
+        # Projects jadvali: description va media_id qo'shildi
         cursor.execute('''CREATE TABLE IF NOT EXISTS projects 
                           (id INTEGER PRIMARY KEY AUTOINCREMENT, 
                            name TEXT, 
-                           price INTEGER, 
+                           price REAL, 
+                           description TEXT,
+                           media_id TEXT,
+                           media_type TEXT,
                            file_id TEXT)''')
         conn.commit()
+        
+    # Migratsiya (Eski bazani yangisiga moslash uchun ustunlar qo'shish)
+    try:
+        db_query("ALTER TABLE projects ADD COLUMN description TEXT", commit=True)
+    except: pass
+    try:
+        db_query("ALTER TABLE projects ADD COLUMN media_id TEXT", commit=True)
+    except: pass
+    try:
+        db_query("ALTER TABLE projects ADD COLUMN media_type TEXT", commit=True)
+    except: pass
+    try:
+        db_query("ALTER TABLE users ADD COLUMN status_level INTEGER DEFAULT 0", commit=True)
+    except: pass
+    try:
+        db_query("ALTER TABLE users ADD COLUMN referrer_id INTEGER", commit=True)
+    except: pass
 
-# Dastur ishga tushganda bazani tekshirish
 init_db()
 
-# --- KONFIGURATSIYA FUNKSIYALARI ---
+# --- KONFIGURATSIYA VA STATUSLAR ---
 def get_config(key, default_value):
     res = db_query("SELECT value FROM config WHERE key = ?", (key,), fetchone=True)
-    if res:
-        return res[0]
-    else:
-        db_query("INSERT INTO config (key, value) VALUES (?, ?)", (key, str(default_value)), commit=True)
-        return default_value
+    if res: return res[0]
+    db_query("INSERT INTO config (key, value) VALUES (?, ?)", (key, str(default_value)), commit=True)
+    return str(default_value)
 
 def set_config(key, value):
     db_query("INSERT OR REPLACE INTO config (key, value) VALUES (?, ?)", (key, str(value)), commit=True)
 
-# --- DINAMIK QIYMATLAR ---
-def get_prices():
-    return {
-        "web": int(get_config("price_web", 50)),
-        "apk": int(get_config("price_apk", 100)),
-        "bot": int(get_config("price_bot", 30))
-    }
+# Status darajalari: 0=Oddiy, 1=PRO, 2=Premium, 3=King
+STATUS_DATA = {
+    0: {"name": "👤 Oddiy", "limit": 30, "price_month": 0, "price_year": 0},
+    1: {"name": "💎 PRO", "limit": 100, "desc": "✅ Clicker (Pul ishlash)\n✅ Limit: 100 SC"},
+    2: {"name": "🔥 Premium", "limit": 1000, "desc": "✅ Loyihalar TEKIN\n✅ Limit: 1000 SC"},
+    3: {"name": "👑 KING", "limit": 100000, "desc": "✅ Hammasi TEKIN (Xizmatlar ham)\n✅ Limit: 100,000 SC"}
+}
 
-def get_pro_prices():
+def get_dynamic_prices():
     return {
-        "1_month": int(get_config("pro_1_month", 20)),
-        "1_year": int(get_config("pro_1_year", 110))
+        "web": float(get_config("price_web", 50.0)),
+        "apk": float(get_config("price_apk", 100.0)),
+        "bot": float(get_config("price_bot", 30.0)),
+        "ref_reward": float(get_config("ref_reward", 1.0)),
+        "click_reward": float(get_config("click_reward", 0.000001)),
+        # Status narxlari (Oyiga)
+        "pro_price": float(get_config("status_price_1", 20.0)),
+        "prem_price": float(get_config("status_price_2", 50.0)),
+        "king_price": float(get_config("status_price_3", 200.0))
     }
 
 def get_coin_rates():
     return {
-        "uzs": int(get_config("rate_uzs", 5000)),
+        "uzs": float(get_config("rate_uzs", 5000.0)),
         "usd": float(get_config("rate_usd", 0.5))
     }
 
-# --- STATES (HOLATLAR) ---
+def get_text(key, default):
+    return get_config(f"text_{key}", default).replace("\\n", "\n")
+
+# --- YORDAMCHI FUNKSIYALAR ---
+def get_user_data(user_id):
+    res = db_query("SELECT balance, status_level, status_expire FROM users WHERE id = ?", (user_id,), fetchone=True)
+    if not res: return None
+    
+    balance, level, expire = res
+    # Status muddatini tekshirish
+    if expire:
+        expire_dt = datetime.datetime.strptime(expire, "%Y-%m-%d %H:%M:%S")
+        if datetime.datetime.now() > expire_dt:
+            db_query("UPDATE users SET status_level = 0, status_expire = NULL WHERE id = ?", (user_id,), commit=True)
+            level = 0
+            expire = None
+    return {"balance": balance, "level": level, "expire": expire}
+
+def format_num(num):
+    # 0.000001 kabi sonlarni to'g'ri chiqarish, ortiqcha nollarni olib tashlash
+    return f"{float(num):.8f}".rstrip('0').rstrip('.')
+
+# --- STATES ---
+class AdminState(StatesGroup):
+    edit_balance_id = State()
+    edit_balance_amount = State()
+    add_proj_name = State()
+    add_proj_price = State()
+    add_proj_desc = State()
+    add_proj_media = State()
+    add_proj_file = State()
+    change_config_value = State()
+    edit_text_key = State()
+    edit_text_val = State()
+
 class OrderService(StatesGroup):
     waiting_for_desc = State()
 
@@ -113,308 +166,443 @@ class FillBalance(StatesGroup):
     waiting_for_receipt = State()
 
 class MoneyTransfer(StatesGroup):
-    waiting_for_recipient_id = State()
+    waiting_for_recipient = State()
     waiting_for_amount = State()
-    confirming_transfer = State()
-
-class AdminState(StatesGroup):
-    main = State()
-    editing_balance_id = State()
-    editing_balance_amount = State()
-    add_project_name = State()
-    add_project_price = State()
-    add_project_file = State()
-    change_price_value = State()
-
-# --- YORDAMCHI FUNKSIYALAR ---
-def check_pro_status(user_id):
-    data = db_query("SELECT is_pro, pro_expire_date FROM users WHERE id = ?", (user_id,), fetchone=True)
-    if data and data[0] == 1:
-        if data[1]: 
-            expire_date = datetime.datetime.strptime(data[1], "%Y-%m-%d %H:%M:%S")
-            if datetime.datetime.now() > expire_date:
-                db_query("UPDATE users SET is_pro = 0, pro_expire_date = NULL WHERE id = ?", (user_id,), commit=True)
-                return False
-        return True
-    return False
-
-def get_user_balance(user_id):
-    res = db_query("SELECT balance FROM users WHERE id = ?", (user_id,), fetchone=True)
-    return res[0] if res else 0
-
-def user_exists(user_id):
-    res = db_query("SELECT id FROM users WHERE id = ?", (user_id,), fetchone=True)
-    return res is not None
+    confirm = State()
 
 # --- KEYBOARDS ---
-def main_menu():
+def main_menu(user_id):
+    user = get_user_data(user_id)
+    level = user['level'] if user else 0
+    
     kb = [
-        [KeyboardButton(text="👤 Kabinet"), KeyboardButton(text="💎 PRO Status")],
-        [KeyboardButton(text="🛠 Buyurtma berish"), KeyboardButton(text="📂 Tayyor Loyihalar")],
-        [KeyboardButton(text="💰 Hisobni to'ldirish")]
+        [KeyboardButton(text="👤 Kabinet"), KeyboardButton(text="🌟 Statuslar")],
+        [KeyboardButton(text="🛠 Xizmatlar"), KeyboardButton(text="📂 Loyihalar")],
+        [KeyboardButton(text="💰 Hisobni to'ldirish"), KeyboardButton(text="💸 Pul ishlash")],
+        [KeyboardButton(text="🏆 Top Userlar")]
     ]
     return ReplyKeyboardMarkup(keyboard=kb, resize_keyboard=True)
 
-def cancel_keyboard():
+def cancel_kb():
     return ReplyKeyboardMarkup(keyboard=[[KeyboardButton(text="🚫 Bekor qilish")]], resize_keyboard=True)
 
-def admin_main_menu():
-    kb = [
-        [InlineKeyboardButton(text="➕ Loyiha Qo'shish", callback_data="admin_add_proj"),
-         InlineKeyboardButton(text="✏️ Balansni Tahrirlash", callback_data="admin_edit_balance")],
-        [InlineKeyboardButton(text="💵 Narxlarni O'zgartirish", callback_data="admin_change_prices")],
-        [InlineKeyboardButton(text="🗑 Loyihani O'chirish", callback_data="admin_del_proj_list")]
-    ]
-    return InlineKeyboardMarkup(inline_keyboard=kb)
-
-def services_menu():
-    prices = get_prices()
-    kb = [
-        [InlineKeyboardButton(text=f"🌐 Web Sayt ({prices['web']} {CURRENCY_SYMBOL})", callback_data="buy_web")],
-        [InlineKeyboardButton(text=f"📱 APK Yaratish ({prices['apk']} {CURRENCY_SYMBOL})", callback_data="buy_apk")],
-        [InlineKeyboardButton(text=f"🤖 Telegram Bot ({prices['bot']} {CURRENCY_SYMBOL})", callback_data="buy_bot")]
-    ]
-    return InlineKeyboardMarkup(inline_keyboard=kb)
-
-def ready_projects_menu(is_pro):
-    kb = []
-    projects = db_query("SELECT id, name, price FROM projects", fetchall=True)
+# --- START VA REFERAL ---
+@dp.message(CommandStart())
+async def cmd_start(message: types.Message, command: CommandObject):
+    referrer_id = None
+    args = command.args
     
-    if not projects:
-        return None 
-
-    for proj in projects:
-        pid, name, price = proj
-        price_text = "TEKIN (PRO)" if is_pro else f"{price} {CURRENCY_SYMBOL}"
-        kb.append([InlineKeyboardButton(text=f"{name} - {price_text}", callback_data=f"getproj_{pid}")])
-    return InlineKeyboardMarkup(inline_keyboard=kb)
-
-# --- ADMIN PANEL LOGIKASI ---
-
-@dp.message(Command("admin"))
-async def admin_start(message: types.Message):
-    if message.from_user.id != ADMIN_ID:
-        return 
-    await message.answer("🔐 **Admin Panelga Xush Kelibsiz!**", reply_markup=admin_main_menu(), parse_mode="Markdown")
-
-@dp.callback_query(F.data == "admin_edit_balance")
-async def admin_edit_balance_start(callback: types.CallbackQuery, state: FSMContext):
-    await callback.message.answer("Foydalanuvchi ID raqamini kiriting:", reply_markup=cancel_keyboard())
-    await state.set_state(AdminState.editing_balance_id)
-    await callback.answer()
-
-@dp.message(AdminState.editing_balance_id)
-async def admin_get_user_id(message: types.Message, state: FSMContext):
-    if not message.text.isdigit():
-        return await message.answer("ID raqam bo'lishi kerak!")
-    user_id = int(message.text)
+    # Referal tekshiruvi
+    if args and args.isdigit():
+        referrer_id = int(args)
+        if referrer_id == message.from_user.id: referrer_id = None
     
-    current = get_user_balance(user_id)
-    await message.answer(f"👤 User: {user_id}\nJoriy balans: {current} {CURRENCY_SYMBOL}\n\nYangi balansni kiriting (Mavjudini o'chirib yozadi!):")
-    
-    await state.update_data(target_id=user_id)
-    await state.set_state(AdminState.editing_balance_amount)
-
-@dp.message(AdminState.editing_balance_amount)
-async def admin_set_balance(message: types.Message, state: FSMContext):
-    try:
-        amount = int(message.text)
-    except ValueError:
-        return await message.answer("Raqam kiriting!")
-    
-    data = await state.get_data()
-    target_id = data['target_id']
-    
-    db_query("INSERT OR IGNORE INTO users (id, balance) VALUES (?, 0)", (target_id,), commit=True)
-    db_query("UPDATE users SET balance = ? WHERE id = ?", (amount, target_id), commit=True)
-    
-    await message.answer(f"✅ User {target_id} balansi {amount} {CURRENCY_SYMBOL} ga o'zgartirildi.", reply_markup=main_menu())
-    await state.clear()
-
-# --- ADMIN: LOYIHA QO'SHISH ---
-@dp.callback_query(F.data == "admin_add_proj")
-async def admin_add_proj_start(callback: types.CallbackQuery, state: FSMContext):
-    await callback.message.answer("🆕 Yangi loyiha nomini kiriting:", reply_markup=cancel_keyboard())
-    await state.set_state(AdminState.add_project_name)
-    await callback.answer()
-
-@dp.message(AdminState.add_project_name)
-async def admin_proj_name(message: types.Message, state: FSMContext):
-    await state.update_data(name=message.text)
-    await message.answer(f"Nomi: {message.text}\n\nEndi narxini kiriting ({CURRENCY_SYMBOL}):")
-    await state.set_state(AdminState.add_project_price)
-
-@dp.message(AdminState.add_project_price)
-async def admin_proj_price(message: types.Message, state: FSMContext):
-    if not message.text.isdigit():
-        return await message.answer("Narx raqam bo'lishi kerak!")
-    await state.update_data(price=int(message.text))
-    await message.answer("Endi faylni yoki havolani yuboring (File yoki Text):")
-    await state.set_state(AdminState.add_project_file)
-
-@dp.message(AdminState.add_project_file)
-async def admin_proj_file(message: types.Message, state: FSMContext):
-    file_data = ""
-    if message.document: file_data = message.document.file_id
-    elif message.video: file_data = message.video.file_id
-    elif message.photo: file_data = message.photo[-1].file_id
-    elif message.text: file_data = message.text
-    else: return await message.answer("Fayl yoki matn yuboring!")
+    # Userni bazaga qo'shish
+    if not db_query("SELECT id FROM users WHERE id = ?", (message.from_user.id,), fetchone=True):
+        db_query("INSERT INTO users (id, balance, referrer_id) VALUES (?, 0.0, ?)", 
+                 (message.from_user.id, referrer_id), commit=True)
         
-    data = await state.get_data()
-    db_query("INSERT INTO projects (name, price, file_id) VALUES (?, ?, ?)", 
-             (data['name'], data['price'], file_data), commit=True)
-    
-    await message.answer("✅ Loyiha qo'shildi!", reply_markup=main_menu())
-    await state.clear()
+        # Referal mukofoti
+        if referrer_id:
+            reward = get_dynamic_prices()['ref_reward']
+            db_query("UPDATE users SET balance = balance + ? WHERE id = ?", (reward, referrer_id), commit=True)
+            try:
+                await bot.send_message(referrer_id, f"🎉 Sizda yangi referal! +{format_num(reward)} {CURRENCY_SYMBOL}")
+            except: pass
 
-# --- ADMIN: LOYIHA O'CHIRISH ---
-@dp.callback_query(F.data == "admin_del_proj_list")
-async def admin_del_list(callback: types.CallbackQuery):
-    projects = db_query("SELECT id, name FROM projects", fetchall=True)
-    kb = []
-    if projects:
-        for p in projects:
-            kb.append([InlineKeyboardButton(text=f"🗑 {p[1]}", callback_data=f"admin_del_p_{p[0]}")])
-    kb.append([InlineKeyboardButton(text="⬅️ Orqaga", callback_data="admin_back")])
-    await callback.message.edit_text("O'chirmoqchi bo'lgan loyihani tanlang:", reply_markup=InlineKeyboardMarkup(inline_keyboard=kb))
+    welcome_text = get_text("welcome", f"👋 Assalomu alaykum, {message.from_user.full_name}!\nBotga xush kelibsiz.")
+    await message.answer(welcome_text, reply_markup=main_menu(message.from_user.id))
 
-@dp.callback_query(F.data.startswith("admin_del_p_"))
-async def admin_delete_proj(callback: types.CallbackQuery):
-    pid = callback.data.split("_")[-1]
-    db_query("DELETE FROM projects WHERE id = ?", (pid,), commit=True)
-    await callback.answer("Loyiha o'chirildi!", show_alert=True)
-    await admin_del_list(callback)
-
-# --- ADMIN: NARXLAR ---
-@dp.callback_query(F.data == "admin_change_prices")
-async def admin_prices_menu(callback: types.CallbackQuery):
-    prices = get_prices()
-    rates = get_coin_rates()
-    kb = [
-        [InlineKeyboardButton(text=f"Web ({prices['web']})", callback_data="set_price_web"),
-         InlineKeyboardButton(text=f"APK ({prices['apk']})", callback_data="set_price_apk")],
-        [InlineKeyboardButton(text=f"Bot ({prices['bot']})", callback_data="set_price_bot")],
-        [InlineKeyboardButton(text=f"1 SC = {rates['uzs']} so'm", callback_data="set_rate_uzs")],
-        [InlineKeyboardButton(text=f"1 USD = ? SC", callback_data="set_rate_usd")],
-        [InlineKeyboardButton(text="⬅️ Orqaga", callback_data="admin_back")]
-    ]
-    await callback.message.edit_text("Narxni tanlang:", reply_markup=InlineKeyboardMarkup(inline_keyboard=kb))
-
-@dp.callback_query(F.data.startswith("set_"))
-async def admin_ask_new_price(callback: types.CallbackQuery, state: FSMContext):
-    key_map = {"set_price_web": "price_web", "set_price_apk": "price_apk", "set_price_bot": "price_bot", "set_rate_uzs": "rate_uzs", "set_rate_usd": "rate_usd"}
-    config_key = key_map.get(callback.data)
-    await state.update_data(config_key=config_key)
-    await callback.message.answer(f"Yangi qiymatni kiriting ({config_key}):", reply_markup=cancel_keyboard())
-    await state.set_state(AdminState.change_price_value)
-    await callback.answer()
-
-@dp.message(AdminState.change_price_value)
-async def admin_save_new_price(message: types.Message, state: FSMContext):
-    try:
-        value = float(message.text) # Float deb tekshiramiz
-    except:
-        return await message.answer("Raqam kiriting.")
-    data = await state.get_data()
-    set_config(data['config_key'], value)
-    await message.answer(f"✅ Yangilandi!", reply_markup=main_menu())
-    await state.clear()
-
-@dp.callback_query(F.data == "admin_back")
-async def back_to_admin(callback: types.CallbackQuery):
-    await callback.message.edit_text("Admin Panel:", reply_markup=admin_main_menu())
-
-# --- USER SIDE HANDLERS ---
-
-@dp.message(F.text == "🚫 Bekor qilish")
-async def cancel_process(message: types.Message, state: FSMContext):
-    await state.clear()
-    await message.answer("Bekor qilindi.", reply_markup=main_menu())
-
-@dp.message(Command("start"))
-async def cmd_start(message: types.Message):
-    db_query("INSERT OR IGNORE INTO users (id, balance) VALUES (?, ?)", (message.from_user.id, 0), commit=True)
-    await message.answer(f"ASOSIY MENYU", 
-                         reply_markup=main_menu(), parse_mode="Markdown")
-
+# --- KABINET ---
 @dp.message(F.text == "👤 Kabinet")
 async def kabinet(message: types.Message):
-    is_pro = check_pro_status(message.from_user.id)
-    balance = get_user_balance(message.from_user.id)
+    data = get_user_data(message.from_user.id)
+    status_name = STATUS_DATA[data['level']]['name']
+    limit = STATUS_DATA[data['level']]['limit']
     
-    res = db_query("SELECT pro_expire_date FROM users WHERE id = ?", (message.from_user.id,), fetchone=True)
-    expire = res[0] if is_pro and res else "Yo'q"
-    status_text = "💎 **PRO**" if is_pro else "👤 **Oddiy**"
+    msg = (f"🆔 ID: `{message.from_user.id}`\n"
+           f"💰 Balans: **{format_num(data['balance'])} {CURRENCY_SYMBOL}**\n"
+           f"📊 Status: {status_name}\n"
+           f"💳 O'tkazma limiti: {limit} SC")
     
-    kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="💸 Pul o'tkazish", callback_data="transfer_money")]])
-    msg = (f"🆔 ID: `{message.from_user.id}`\n💰 Balans: **{balance} {CURRENCY_SYMBOL}**\n📊 Status: {status_text}\n")
-    if is_pro: msg += f"⏳ Tugash: `{expire}`"
-    
+    if data['expire']:
+        msg += f"\n⏳ Status tugash vaqti: `{data['expire']}`"
+        
+    kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="💸 Pul o'tkazish", callback_data="transfer_start")]])
     await message.answer(msg, reply_markup=kb, parse_mode="Markdown")
 
-# --- PUL O'TKAZISH ---
-@dp.callback_query(F.data == "transfer_money")
-async def start_transfer(callback: types.CallbackQuery, state: FSMContext):
-    await callback.message.answer("Qabul qiluvchi ID raqamini yozing:", reply_markup=cancel_keyboard())
-    await state.set_state(MoneyTransfer.waiting_for_recipient_id)
+# --- PUL ISHLASH (REFERAL & CLICKER) ---
+@dp.message(F.text == "💸 Pul ishlash")
+async def earn_money(message: types.Message):
+    user = get_user_data(message.from_user.id)
+    prices = get_dynamic_prices()
+    
+    ref_link = f"https://t.me/{(await bot.get_me()).username}?start={message.from_user.id}"
+    
+    msg = (f"🔗 **Sizning referal havolangiz:**\n`{ref_link}`\n\n"
+           f"Har bir taklif uchun: **{format_num(prices['ref_reward'])} {CURRENCY_SYMBOL}**")
+    
+    kb_rows = []
+    # Faqat PRO va undan yuqori statuslar uchun Clicker
+    if user['level'] >= 1:
+        msg += f"\n\n💎 **PRO Clicker** faol!\nHar bosishda: {format_num(prices['click_reward'])} SC"
+        kb_rows.append([InlineKeyboardButton(text="👆 CLICK ME", callback_data="clicker_process")])
+    else:
+        msg += "\n\n🔒 **Clicker** yopiq. PRO status oling!"
+        kb_rows.append([InlineKeyboardButton(text="💎 PRO sotib olish", callback_data="open_status_shop")])
+        
+    await message.answer(msg, reply_markup=InlineKeyboardMarkup(inline_keyboard=kb_rows), parse_mode="Markdown")
+
+@dp.callback_query(F.data == "clicker_process")
+async def process_click(callback: types.CallbackQuery):
+    user = get_user_data(callback.from_user.id)
+    if user['level'] < 1:
+        return await callback.answer("Faqat PRO statusdagilar uchun!", show_alert=True)
+    
+    reward = get_dynamic_prices()['click_reward']
+    db_query("UPDATE users SET balance = balance + ? WHERE id = ?", (reward, callback.from_user.id), commit=True)
+    
+    # Vizual effekt uchun (har doim ham edit qilish shart emas, limit tufayli)
+    # Ammo user bilsin deb kichik alert beramiz
+    await callback.answer(f"+{format_num(reward)} SC", cache_time=1)
+
+# --- STATUSLAR DOKONI ---
+@dp.message(F.text == "🌟 Statuslar")
+async def status_shop(message: types.Message):
+    await show_status_menu(message)
+
+@dp.callback_query(F.data == "open_status_shop")
+async def cb_status_shop(callback: types.CallbackQuery):
+    await show_status_menu(callback.message)
+
+async def show_status_menu(message: types.Message):
+    prices = get_dynamic_prices()
+    kb = [
+        [InlineKeyboardButton(text=f"💎 PRO ({prices['pro_price']} SC)", callback_data="buy_status_1")],
+        [InlineKeyboardButton(text=f"🔥 Premium ({prices['prem_price']} SC)", callback_data="buy_status_2")],
+        [InlineKeyboardButton(text=f"👑 KING ({prices['king_price']} SC)", callback_data="buy_status_3")]
+    ]
+    
+    info = (f"**STATUSLAR NARXI (1 OY):**\n\n"
+            f"💎 **PRO** - {prices['pro_price']} SC\n{STATUS_DATA[1]['desc']}\n\n"
+            f"🔥 **PREMIUM** - {prices['prem_price']} SC\n{STATUS_DATA[2]['desc']}\n\n"
+            f"👑 **KING** - {prices['king_price']} SC\n{STATUS_DATA[3]['desc']}")
+    
+    if isinstance(message, types.CallbackQuery):
+        await message.message.edit_text(info, reply_markup=InlineKeyboardMarkup(inline_keyboard=kb), parse_mode="Markdown")
+    else:
+        await message.answer(info, reply_markup=InlineKeyboardMarkup(inline_keyboard=kb), parse_mode="Markdown")
+
+@dp.callback_query(F.data.startswith("buy_status_"))
+async def buy_status_handler(callback: types.CallbackQuery):
+    lvl = int(callback.data.split("_")[-1])
+    prices = get_dynamic_prices()
+    price_map = {1: prices['pro_price'], 2: prices['prem_price'], 3: prices['king_price']}
+    cost = price_map[lvl]
+    
+    user = get_user_data(callback.from_user.id)
+    
+    if user['level'] >= lvl:
+        return await callback.answer("Sizda bu status (yoki yuqorirog'i) mavjud!", show_alert=True)
+    
+    if user['balance'] < cost:
+        return await callback.answer("Mablag' yetarli emas!", show_alert=True)
+    
+    expire_date = (datetime.datetime.now() + datetime.timedelta(days=30)).strftime("%Y-%m-%d %H:%M:%S")
+    
+    db_query("UPDATE users SET balance = balance - ?, status_level = ?, status_expire = ? WHERE id = ?", 
+             (cost, lvl, expire_date, callback.from_user.id), commit=True)
+    
+    await callback.message.answer(f"🎉 Tabriklaymiz! Siz **{STATUS_DATA[lvl]['name']}** statusini sotib oldingiz!")
+    await callback.message.delete()
+
+# --- TOP USERLAR ---
+@dp.message(F.text == "🏆 Top Userlar")
+async def top_users(message: types.Message):
+    users = db_query("SELECT id, balance, status_level FROM users ORDER BY balance DESC LIMIT 10", fetchall=True)
+    msg = "🏆 **TOP 10 BOY FOYDALANUVCHILAR:**\n\n"
+    
+    for idx, (uid, bal, lvl) in enumerate(users, 1):
+        # Ism o'rniga ID ishlatamiz maxfiylik uchun, yoki user linki
+        badge = ""
+        if lvl == 1: badge = "💎"
+        elif lvl == 2: badge = "🔥"
+        elif lvl == 3: badge = "👑"
+        
+        msg += f"{idx}. {badge} ID: `{uid}` - **{format_num(bal)} {CURRENCY_SYMBOL}**\n"
+        
+    await message.answer(msg, parse_mode="Markdown")
+
+# --- LOYIHALAR BO'LIMI (YANGILANGAN) ---
+@dp.message(F.text == "📂 Loyihalar")
+async def show_projects(message: types.Message):
+    projs = db_query("SELECT id, name FROM projects", fetchall=True)
+    if not projs: return await message.answer("Hozircha loyihalar yo'q.")
+    
+    kb = []
+    for pid, name in projs:
+        kb.append([InlineKeyboardButton(text=name, callback_data=f"view_proj_{pid}")])
+    await message.answer("Qiziqtirgan loyihani tanlang:", reply_markup=InlineKeyboardMarkup(inline_keyboard=kb))
+
+@dp.callback_query(F.data.startswith("view_proj_"))
+async def view_project(callback: types.CallbackQuery):
+    pid = int(callback.data.split("_")[-1])
+    proj = db_query("SELECT name, price, description, media_id, media_type FROM projects WHERE id = ?", (pid,), fetchone=True)
+    
+    if not proj: return await callback.answer("Loyiha topilmadi.")
+    name, price, desc, mid, mtype = proj
+    
+    user = get_user_data(callback.from_user.id)
+    # Narx logikasi
+    is_free = (user['level'] >= 2) # Premium va King ga tekin
+    final_price_text = "TEKIN (Status)" if is_free else f"{format_num(price)} {CURRENCY_SYMBOL}"
+    
+    caption = f"📂 **{name}**\n\n📝 {desc}\n\n💰 Narxi: {final_price_text}"
+    kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="📥 Sotib olish / Yuklash", callback_data=f"buy_proj_{pid}")]])
+    
+    if mid:
+        if mtype == 'video':
+            await callback.message.answer_video(mid, caption=caption, reply_markup=kb, parse_mode="Markdown")
+        elif mtype == 'photo':
+            await callback.message.answer_photo(mid, caption=caption, reply_markup=kb, parse_mode="Markdown")
+        else:
+            await callback.message.answer(caption, reply_markup=kb, parse_mode="Markdown")
+    else:
+        await callback.message.answer(caption, reply_markup=kb, parse_mode="Markdown")
     await callback.answer()
 
-@dp.message(MoneyTransfer.waiting_for_recipient_id)
-async def process_recipient_id(message: types.Message, state: FSMContext):
-    if not message.text.isdigit(): return await message.answer("Faqat raqam!")
-    recipient_id = int(message.text)
+@dp.callback_query(F.data.startswith("buy_proj_"))
+async def buy_project_process(callback: types.CallbackQuery):
+    pid = int(callback.data.split("_")[-1])
+    proj = db_query("SELECT price, file_id, name FROM projects WHERE id = ?", (pid,), fetchone=True)
+    if not proj: return
+    price, file_id, name = proj
     
-    if recipient_id == message.from_user.id: return await message.answer("O'zingizga pul o'tkaza olmaysiz!")
-    if not user_exists(recipient_id): return await message.answer("Bunday foydalanuvchi topilmadi!")
+    user = get_user_data(callback.from_user.id)
+    is_free = (user['level'] >= 2) # Premium va King
     
-    await state.update_data(recipient_id=recipient_id)
-    await message.answer(f"Summani kiriting ({CURRENCY_SYMBOL}):")
+    if not is_free:
+        if user['balance'] < price:
+            return await callback.answer("Mablag' yetarli emas!", show_alert=True)
+        db_query("UPDATE users SET balance = balance - ? WHERE id = ?", (price, callback.from_user.id), commit=True)
+        await callback.message.answer(f"💰 -{format_num(price)} {CURRENCY_SYMBOL} yechildi.")
+    
+    await callback.message.answer_document(file_id, caption=f"✅ {name} fayli.\nRahmat!")
+    await callback.answer()
+
+# --- XIZMATLAR ---
+@dp.message(F.text == "🛠 Xizmatlar")
+async def services_menu(message: types.Message):
+    prices = get_dynamic_prices()
+    kb = [
+        [InlineKeyboardButton(text=f"🌐 Web ({prices['web']} SC)", callback_data="serv_web")],
+        [InlineKeyboardButton(text=f"📱 APK ({prices['apk']} SC)", callback_data="serv_apk")],
+        [InlineKeyboardButton(text=f"🤖 Bot ({prices['bot']} SC)", callback_data="serv_bot")]
+    ]
+    await message.answer("Xizmat turini tanlang:", reply_markup=InlineKeyboardMarkup(inline_keyboard=kb))
+
+@dp.callback_query(F.data.startswith("serv_"))
+async def service_select(callback: types.CallbackQuery, state: FSMContext):
+    stype = callback.data.split("_")[1]
+    prices = get_dynamic_prices()
+    cost = prices.get(stype, 0)
+    
+    user = get_user_data(callback.from_user.id)
+    # King status (level 3) ga xizmatlar tekin
+    if user['level'] == 3:
+        cost = 0
+        await callback.message.answer("👑 King Status: Xizmat siz uchun bepul!")
+    elif user['balance'] < cost:
+        return await callback.answer("Mablag' yetarli emas!", show_alert=True)
+        
+    await state.update_data(stype=stype, cost=cost)
+    await callback.message.answer("Texnik topshiriqni batafsil yozib yuboring:", reply_markup=cancel_kb())
+    await state.set_state(OrderService.waiting_for_desc)
+
+@dp.message(OrderService.waiting_for_desc)
+async def service_confirm(message: types.Message, state: FSMContext):
+    data = await state.get_data()
+    cost = data['cost']
+    
+    if cost > 0:
+        db_query("UPDATE users SET balance = balance - ? WHERE id = ?", (cost, message.from_user.id), commit=True)
+        
+    await bot.send_message(ADMIN_ID, 
+                           f"🛠 **YANGI BUYURTMA**\n"
+                           f"👤 User: `{message.from_user.id}`\n"
+                           f"🧩 Tur: {data['stype']}\n"
+                           f"💰 To'landi: {cost}\n"
+                           f"📝 Matn: {message.text}")
+    
+    await message.answer("Buyurtma qabul qilindi! Admin tez orada aloqaga chiqadi.", reply_markup=main_menu(message.from_user.id))
+    await state.clear()
+
+# --- PUL O'TKAZISH (LIMITLAR BILAN) ---
+@dp.callback_query(F.data == "transfer_start")
+async def transfer_start(callback: types.CallbackQuery, state: FSMContext):
+    await callback.message.answer("Qabul qiluvchi ID raqamini kiriting:", reply_markup=cancel_kb())
+    await state.set_state(MoneyTransfer.waiting_for_recipient)
+
+@dp.message(MoneyTransfer.waiting_for_recipient)
+async def transfer_id(message: types.Message, state: FSMContext):
+    if not message.text.isdigit(): return await message.answer("Raqam bo'lsin!")
+    rid = int(message.text)
+    if not db_query("SELECT id FROM users WHERE id = ?", (rid,), fetchone=True):
+        return await message.answer("User topilmadi!")
+        
+    await state.update_data(rid=rid)
+    user = get_user_data(message.from_user.id)
+    limit = STATUS_DATA[user['level']]['limit']
+    
+    await message.answer(f"Qancha o'tkazmoqchisiz?\nSizning limit: {limit} SC", reply_markup=cancel_kb())
     await state.set_state(MoneyTransfer.waiting_for_amount)
 
 @dp.message(MoneyTransfer.waiting_for_amount)
-async def process_transfer_amount(message: types.Message, state: FSMContext):
-    if not message.text.isdigit(): return await message.answer("Butun son kiriting!")
-    amount = int(message.text)
-    if amount <= 0: return await message.answer("Musbat son kiriting!")
+async def transfer_amount(message: types.Message, state: FSMContext):
+    try:
+        amount = float(message.text)
+    except:
+        return await message.answer("Raqam kiriting (masalan 10 yoki 0.5)")
         
-    commission = int(amount * 0.01)
-    if commission < 1: commission = 1
-    total = amount + commission
+    if amount <= 0: return await message.answer("Musbat son kiriting.")
     
-    if get_user_balance(message.from_user.id) < total:
-        return await message.answer(f"Mablag' yetarli emas! Jami kerak: {total}")
-
-    await state.update_data(amount=amount, total_deduct=total)
-    kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="✅ Ha", callback_data="confirm_yes"), InlineKeyboardButton(text="❌ Yo'q", callback_data="confirm_no")]
-    ])
-    await message.answer(f"Yuborilmoqda: {amount}\nKomissiya: {commission}\nJami: {total}\nTasdiqlaysizmi?", reply_markup=kb)
-    await state.set_state(MoneyTransfer.confirming_transfer)
-
-@dp.callback_query(MoneyTransfer.confirming_transfer, F.data == "confirm_yes")
-async def execute_transfer(callback: types.CallbackQuery, state: FSMContext):
+    user = get_user_data(message.from_user.id)
+    limit = STATUS_DATA[user['level']]['limit']
+    
+    if amount > limit:
+        return await message.answer(f"Sizning statusingiz bo'yicha limit: {limit} SC.\nLimitni oshirish uchun status sotib oling!")
+        
+    if user['balance'] < amount:
+        return await message.answer("Balans yetarli emas!")
+        
     data = await state.get_data()
-    sid, rid, amt, tot = callback.from_user.id, data['recipient_id'], data['amount'], data['total_deduct']
+    db_query("UPDATE users SET balance = balance - ? WHERE id = ?", (amount, message.from_user.id), commit=True)
+    db_query("UPDATE users SET balance = balance + ? WHERE id = ?", (amount, data['rid']), commit=True)
     
-    if get_user_balance(sid) < tot:
-        await callback.answer("Mablag' yetarli emas!", show_alert=True)
-        return await state.clear()
-
-    db_query("UPDATE users SET balance = balance - ? WHERE id = ?", (tot, sid), commit=True)
-    db_query("UPDATE users SET balance = balance + ? WHERE id = ?", (amt, rid), commit=True)
-    
-    await callback.message.edit_text(f"✅ O'tkazildi!")
-    try: await bot.send_message(rid, f"📥 +{amt} {CURRENCY_SYMBOL} kelib tushdi! (ID: {sid})")
+    await message.answer("✅ O'tkazma muvaffaqiyatli bajarildi!", reply_markup=main_menu(message.from_user.id))
+    try: await bot.send_message(data['rid'], f"📥 Sizga +{format_num(amount)} SC kelib tushdi! (User: {message.from_user.id})")
     except: pass
     await state.clear()
 
-@dp.callback_query(MoneyTransfer.confirming_transfer, F.data == "confirm_no")
-async def cancel_transfer(callback: types.CallbackQuery, state: FSMContext):
-    await callback.message.edit_text("❌ Bekor qilindi.")
+# --- ADMIN PANEL (KENGAYTIRILGAN) ---
+@dp.message(Command("admin"))
+async def admin_panel(message: types.Message):
+    if message.from_user.id != ADMIN_ID: return
+    kb = [
+        [InlineKeyboardButton(text="➕ Loyiha Qo'shish", callback_data="adm_add_proj"),
+         InlineKeyboardButton(text="💵 Narxlar va Sozlamalar", callback_data="adm_prices")],
+        [InlineKeyboardButton(text="📝 Matnlarni Tahrirlash", callback_data="adm_texts")],
+        [InlineKeyboardButton(text="✏️ User Balansi", callback_data="adm_edit_bal")]
+    ]
+    await message.answer("🔐 Admin Panel v2.0", reply_markup=InlineKeyboardMarkup(inline_keyboard=kb))
+
+# 1. Loyiha qo'shish (Wizard)
+@dp.callback_query(F.data == "adm_add_proj")
+async def adm_add_proj_start(callback: types.CallbackQuery, state: FSMContext):
+    await callback.message.answer("Loyiha nomini yozing:", reply_markup=cancel_kb())
+    await state.set_state(AdminState.add_proj_name)
+
+@dp.message(AdminState.add_proj_name)
+async def adm_p_name(message: types.Message, state: FSMContext):
+    await state.update_data(name=message.text)
+    await message.answer("Narxini kiriting (SC):")
+    await state.set_state(AdminState.add_proj_price)
+
+@dp.message(AdminState.add_proj_price)
+async def adm_p_price(message: types.Message, state: FSMContext):
+    try:
+        val = float(message.text)
+    except: return await message.answer("Raqam yozing!")
+    await state.update_data(price=val)
+    await message.answer("Loyiha haqida tavsif (Description) yozing:")
+    await state.set_state(AdminState.add_proj_desc)
+
+@dp.message(AdminState.add_proj_desc)
+async def adm_p_desc(message: types.Message, state: FSMContext):
+    await state.update_data(desc=message.text)
+    await message.answer("Rasm yoki Video yuboring (Ixtiyoriy, 'skip' deb yozsangiz o'tkazib yuboriladi):")
+    await state.set_state(AdminState.add_proj_media)
+
+@dp.message(AdminState.add_proj_media)
+async def adm_p_media(message: types.Message, state: FSMContext):
+    mid, mtype = None, None
+    if message.photo:
+        mid, mtype = message.photo[-1].file_id, "photo"
+    elif message.video:
+        mid, mtype = message.video.file_id, "video"
+    elif message.text and message.text.lower() != 'skip':
+        return await message.answer("Rasm, video yoki 'skip' yozing.")
+        
+    await state.update_data(mid=mid, mtype=mtype)
+    await message.answer("Endi asosiy faylni (zip, rar, txt) yuboring:")
+    await state.set_state(AdminState.add_proj_file)
+
+@dp.message(AdminState.add_proj_file)
+async def adm_p_file(message: types.Message, state: FSMContext):
+    if not message.document: return await message.answer("Fayl yuboring!")
+    data = await state.get_data()
+    
+    db_query("INSERT INTO projects (name, price, description, media_id, media_type, file_id) VALUES (?,?,?,?,?,?)",
+             (data['name'], data['price'], data['desc'], data['mid'], data['mtype'], message.document.file_id), commit=True)
+    
+    await message.answer("✅ Loyiha qo'shildi!", reply_markup=main_menu(message.from_user.id))
     await state.clear()
 
-# --- HISOB TO'LDIRISH (MUAMMO BO'LGAN QISM) ---
+# 2. Narxlar
+@dp.callback_query(F.data == "adm_prices")
+async def adm_prices_list(callback: types.CallbackQuery):
+    p = get_dynamic_prices()
+    kb = [
+        [InlineKeyboardButton(text=f"Ref Bonus ({p['ref_reward']})", callback_data="set_ref_reward"),
+         InlineKeyboardButton(text=f"Click ({p['click_reward']})", callback_data="set_click_reward")],
+        [InlineKeyboardButton(text=f"PRO ({p['pro_price']})", callback_data="set_status_price_1"),
+         InlineKeyboardButton(text=f"Premium ({p['prem_price']})", callback_data="set_status_price_2")],
+        [InlineKeyboardButton(text=f"KING ({p['king_price']})", callback_data="set_status_price_3")]
+    ]
+    await callback.message.edit_text("Nimani o'zgartiramiz?", reply_markup=InlineKeyboardMarkup(inline_keyboard=kb))
+
+@dp.callback_query(F.data.startswith("set_"))
+async def adm_set_val(callback: types.CallbackQuery, state: FSMContext):
+    key = callback.data.replace("set_", "")
+    await state.update_data(conf_key=key)
+    await callback.message.answer(f"Yangi qiymatni yozing ({key}):", reply_markup=cancel_kb())
+    await state.set_state(AdminState.change_config_value)
+
+@dp.message(AdminState.change_config_value)
+async def adm_save_val(message: types.Message, state: FSMContext):
+    try:
+        val = float(message.text)
+        data = await state.get_data()
+        set_config(data['conf_key'], val)
+        await message.answer("✅ Saqlandi!", reply_markup=main_menu(message.from_user.id))
+        await state.clear()
+    except:
+        await message.answer("Raqam yozing.")
+
+# 3. Matnlarni tahrirlash
+@dp.callback_query(F.data == "adm_texts")
+async def adm_texts(callback: types.CallbackQuery):
+    kb = [
+        [InlineKeyboardButton(text="Welcome Text", callback_data="txt_welcome")]
+    ]
+    await callback.message.edit_text("Qaysi matnni o'zgartirasiz?", reply_markup=InlineKeyboardMarkup(inline_keyboard=kb))
+
+@dp.callback_query(F.data.startswith("txt_"))
+async def adm_txt_edit(callback: types.CallbackQuery, state: FSMContext):
+    key = callback.data.replace("txt_", "text_")
+    await state.update_data(txt_key=key)
+    curr = get_config(key, "Mavjud emas")
+    await callback.message.answer(f"Hozirgi:\n{curr}\n\nYangisini yozing:", reply_markup=cancel_kb())
+    await state.set_state(AdminState.edit_text_val)
+
+@dp.message(AdminState.edit_text_val)
+async def adm_txt_save(message: types.Message, state: FSMContext):
+    data = await state.get_data()
+    set_config(data['txt_key'], message.text) # \n larni o'zi handle qiladi
+    await message.answer("✅ Matn yangilandi!", reply_markup=main_menu(message.from_user.id))
+    await state.clear()
+
+# --- HISOB TO'LDIRISH (ESKISI BILAN BIR XIL, LEKIN FLOAT) ---
 @dp.message(F.text == "💰 Hisobni to'ldirish")
 async def topup_start(message: types.Message, state: FSMContext):
     kb = ReplyKeyboardMarkup(keyboard=[
@@ -425,168 +613,66 @@ async def topup_start(message: types.Message, state: FSMContext):
     await state.set_state(FillBalance.choosing_currency)
 
 @dp.message(FillBalance.choosing_currency)
-async def topup_currency(message: types.Message, state: FSMContext):
+async def topup_curr(message: types.Message, state: FSMContext):
     rates = get_coin_rates()
     if "UZS" in message.text:
-        curr, rate, card = "UZS", rates['uzs'], f"Humo/Uzcard: `{CARD_UZS}`"
-        rate_text = f"1 SC = {rate} so'm"
+        curr, rate, card = "UZS", rates['uzs'], CARD_UZS
     elif "USD" in message.text:
-        curr, rate, card = "USD", rates['usd'], f"Visa: `{CARD_VISA}`"
-        rate_text = f"1 USD = {int(1/rate) if rate>0 else 0} SC"
+        curr, rate, card = "USD", rates['usd'], CARD_VISA
     else: return await message.answer("Tanlang!")
-
-    await state.update_data(currency=curr, rate=rate)
-    await message.answer(f"{card}\n{CARD_NAME}\n\nKurs: {rate_text}\nQancha **{CURRENCY_NAME}** olmoqchisiz?", 
-                         reply_markup=cancel_keyboard(), parse_mode="Markdown")
+    
+    await state.update_data(curr=curr, rate=rate)
+    await message.answer(f"Karta: `{card}`\nKurs: 1 SC = {rate} {curr}\nQancha SC olmoqchisiz?", reply_markup=cancel_kb(), parse_mode="Markdown")
     await state.set_state(FillBalance.waiting_for_amount)
 
 @dp.message(FillBalance.waiting_for_amount)
-async def topup_amount(message: types.Message, state: FSMContext):
-    if not message.text.isdigit(): return await message.answer("Raqam yozing!")
-    coins = int(message.text)
+async def topup_amt(message: types.Message, state: FSMContext):
+    try:
+        amt = float(message.text)
+    except: return await message.answer("Raqam yozing!")
+    
     data = await state.get_data()
+    total = amt * data['rate']
+    txt = f"{total} so'm" if data['curr'] == "UZS" else f"{total} $"
     
-    pay_val = coins * data['rate']
-    pay_text = f"{pay_val} so'm" if data['currency'] == "UZS" else f"{pay_val} $"
-    
-    await state.update_data(coins=coins, total_pay=pay_text)
-    await message.answer(f"To'lov: **{pay_text}**\nChekni yuboring:", reply_markup=cancel_keyboard(), parse_mode="Markdown")
+    await state.update_data(amt=amt, txt=txt)
+    await message.answer(f"To'lov miqdori: **{txt}**\nChekni yuboring:", parse_mode="Markdown")
     await state.set_state(FillBalance.waiting_for_receipt)
 
 @dp.message(FillBalance.waiting_for_receipt, F.photo)
-async def topup_receipt(message: types.Message, state: FSMContext):
+async def topup_rec(message: types.Message, state: FSMContext):
     data = await state.get_data()
     kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="✅ Tasdiqlash", callback_data=f"pay_approve:{message.from_user.id}:{data['coins']}"),
-         InlineKeyboardButton(text="❌ Rad etish", callback_data=f"pay_reject:{message.from_user.id}")]
+        [InlineKeyboardButton(text="✅ Tasdiq", callback_data=f"p_ok:{message.from_user.id}:{data['amt']}"),
+         InlineKeyboardButton(text="❌ Rad", callback_data=f"p_no:{message.from_user.id}")]
     ])
-    await bot.send_photo(ADMIN_ID, photo=message.photo[-1].file_id, 
-                         caption=f"🔔 **To'lov**\nUser: `{message.from_user.id}`\nMiqdor: {data['coins']} SC\nTo'lov: {data['total_pay']}", 
-                         reply_markup=kb, parse_mode="Markdown")
-    await message.answer("Adminga yuborildi, kuting...", reply_markup=main_menu())
+    await bot.send_photo(ADMIN_ID, message.photo[-1].file_id, 
+                         caption=f"To'lov!\nUser: {message.from_user.id}\nSC: {data['amt']}\nPul: {data['txt']}", reply_markup=kb)
+    await message.answer("Adminga yuborildi.")
     await state.clear()
 
-# --- TUZATILGAN QISM: TO'LOVNI TASDIQLASH ---
-@dp.callback_query(F.data.startswith("pay_approve:"))
-async def approve_payment(callback: types.CallbackQuery):
-    try:
-        # Ma'lumotlarni ajratib olamiz
-        parts = callback.data.split(":")
-        user_id = int(parts[1]) # MUHIM: int() ga o'tkazish
-        amount = int(parts[2])  # MUHIM: int() ga o'tkazish
-
-        # Avval user bazada borligini tekshiramiz, bo'lmasa yaratamiz
-        db_query("INSERT OR IGNORE INTO users (id, balance) VALUES (?, 0)", (user_id,), commit=True)
-        
-        # Balansni yangilash
-        db_query("UPDATE users SET balance = balance + ? WHERE id = ?", (amount, user_id), commit=True)
-        
-        await bot.send_message(user_id, f"✅ To'lov tasdiqlandi! +{amount} {CURRENCY_SYMBOL} qo'shildi.")
-        await callback.message.edit_caption(caption=callback.message.caption + "\n\n✅ TASDIQLANDI")
-        
-    except Exception as e:
-        await callback.answer(f"Xatolik: {e}", show_alert=True)
-        logging.error(f"Approval Error: {e}")
-
-@dp.callback_query(F.data.startswith("pay_reject:"))
-async def reject_payment(callback: types.CallbackQuery):
-    user_id = int(callback.data.split(":")[1])
-    await bot.send_message(user_id, "❌ To'lov rad etildi.")
-    await callback.message.edit_caption(caption=callback.message.caption + "\n\n❌ RAD ETILDI")
-
-# --- PRO STATUS ---
-@dp.message(F.text == "💎 PRO Status")
-async def pro_handler(message: types.Message):
-    if check_pro_status(message.from_user.id):
-        await message.answer("Sizda allaqachon PRO status mavjud!")
-    else:
-        prices = get_pro_prices()
-        kb = InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text=f"1 Oy - {prices['1_month']} SC", callback_data="buypro_1_month")],
-            [InlineKeyboardButton(text=f"1 Yil - {prices['1_year']} SC", callback_data="buypro_1_year")]
-        ])
-        await message.answer("💎 PRO Status sotib olish:", reply_markup=kb)
-
-@dp.callback_query(F.data.startswith("buypro_"))
-async def buy_pro(callback: types.CallbackQuery):
-    plan = callback.data.replace("buypro_", "")
-    price = get_pro_prices()[plan]
-    days = 30 if plan == "1_month" else 365
-    
-    if get_user_balance(callback.from_user.id) < price:
-        return await callback.answer("Mablag' yetarli emas!", show_alert=True)
-
-    expire_str = (datetime.datetime.now() + datetime.timedelta(days=days)).strftime("%Y-%m-%d %H:%M:%S")
-    db_query("UPDATE users SET balance = balance - ?, is_pro = 1, pro_expire_date = ? WHERE id = ?", 
-             (price, expire_str, callback.from_user.id), commit=True)
-    
-    await callback.message.answer(f"🎉 PRO status faollashdi! Tugash: {expire_str}")
+@dp.callback_query(F.data.startswith("p_ok:"))
+async def approve_pay(callback: types.CallbackQuery):
+    parts = callback.data.split(":")
+    uid, amt = int(parts[1]), float(parts[2])
+    db_query("UPDATE users SET balance = balance + ? WHERE id = ?", (amt, uid), commit=True)
+    await bot.send_message(uid, f"✅ Hisobingizga +{amt} SC qo'shildi!")
     await callback.message.delete()
 
-# --- TAYYOR LOYIHALAR ---
-@dp.message(F.text == "📂 Tayyor Loyihalar")
-async def ready_projects(message: types.Message):
-    kb = ready_projects_menu(check_pro_status(message.from_user.id))
-    if not kb: await message.answer("Loyihalar yo'q.")
-    else: await message.answer("📂 Loyihani tanlang:", reply_markup=kb)
+@dp.callback_query(F.data.startswith("p_no:"))
+async def reject_pay(callback: types.CallbackQuery):
+    uid = int(callback.data.split(":")[1])
+    await bot.send_message(uid, "❌ To'lovingiz rad etildi.")
+    await callback.message.delete()
 
-@dp.callback_query(F.data.startswith("getproj_"))
-async def get_project(callback: types.CallbackQuery):
-    pid = callback.data.split("_")[1]
-    res = db_query("SELECT name, price, file_id FROM projects WHERE id = ?", (pid,), fetchone=True)
-    if not res: return await callback.answer("Loyiha topilmadi!", show_alert=True)
-
-    name, price, file_id = res
-    uid = callback.from_user.id
-    is_pro = check_pro_status(uid)
-
-    if not is_pro:
-        if get_user_balance(uid) < price: return await callback.answer("Pul yetmaydi!", show_alert=True)
-        db_query("UPDATE users SET balance = balance - ? WHERE id = ?", (price, uid), commit=True)
-        msg_text = f"✅ Sotib olindi: -{price}"
-    else:
-        msg_text = "💎 PRO bilan bepul olindi!"
-
-    await callback.message.answer(msg_text)
-    if file_id.startswith("http"): await callback.message.answer(f"📥 {name}\nLINK: {file_id}")
-    else: 
-        try: await callback.message.answer_document(file_id, caption=f"📥 {name}")
-        except: await callback.message.answer(f"File ID xato: {file_id}")
-    await callback.answer()
-
-# --- BUYURTMA ---
-@dp.message(F.text == "🛠 Buyurtma berish")
-async def custom_services(message: types.Message):
-    await message.answer("Xizmat turini tanlang:", reply_markup=services_menu())
-
-@dp.callback_query(F.data.startswith("buy_"))
-async def process_buy_service(callback: types.CallbackQuery, state: FSMContext):
-    service = callback.data.split("_")[1]
-    price = get_prices().get(service, 0)
-    
-    if get_user_balance(callback.from_user.id) < price:
-        await callback.answer("Mablag' yetarli emas!", show_alert=True)
-    else:
-        await state.update_data(chosen_service=service, price=price)
-        await callback.message.answer("Texnik topshiriqni yozing:", reply_markup=cancel_keyboard())
-        await state.set_state(OrderService.waiting_for_desc)
-    await callback.answer()
-
-@dp.message(OrderService.waiting_for_desc)
-async def finish_order(message: types.Message, state: FSMContext):
-    data = await state.get_data()
-    db_query("UPDATE users SET balance = balance - ? WHERE id = ?", (data['price'], message.from_user.id), commit=True)
-    
-    await bot.send_message(ADMIN_ID, f"🚀 BUYURTMA!\nUser: {message.from_user.id}\nXizmat: {data['chosen_service']}\nMatn: {message.text}")
-    await message.answer("Buyurtma qabul qilindi!", reply_markup=main_menu())
+# --- GENERIC CANCEL ---
+@dp.message(F.text == "🚫 Bekor qilish")
+async def cancel_all(message: types.Message, state: FSMContext):
     await state.clear()
+    await message.answer("Bekor qilindi.", reply_markup=main_menu(message.from_user.id))
 
 async def main():
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
-    import asyncio
-    try:
-        asyncio.run(main())
-    except KeyboardInterrupt:
-        print("Bot to'xtatildi.")
+    asyncio.run(main())
