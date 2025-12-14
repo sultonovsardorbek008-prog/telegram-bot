@@ -94,9 +94,9 @@ def set_config(key, value):
 # Status darajalari: 0=Start, 1=Silver, 2=Gold, 3=Platinum (Rebranding)
 STATUS_DATA = {
     0: {"name": "👤 Start", "limit": 30, "price_month": 0},
-    1: {"name": "🥈 Silver", "limit": 100, "desc": "✅ Clicker (Pul ishlash)\n✅ Limit: 100 UZC"},
-    2: {"name": "🥇 Gold", "limit": 1000, "desc": "✅ Loyihalar 50% chegirma\n✅ Limit: 1000 UZC"},
-    3: {"name": "💎 Platinum", "limit": 100000, "desc": "✅ Hammasi TEKIN (Xizmatlar ham)\n✅ Limit: Cheksiz"}
+    1: {"name": "🥈 Silver", "limit": 100, "desc": "✅ Clicker (Pul ishlash)\n✅ Limit: 100 🪙"},
+    2: {"name": "🥇 Gold", "limit": 1000, "desc": "✅ Loyihalar 50% chegirma\n✅ Limit: 1000 🪙"},
+    3: {"name": "💎 Platinum", "limit": 100000, "desc": "✅ Hammasi TEKIN (Xizmatlar ham)\n✅ Limit: 100000 🪙"}
 }
 
 def get_dynamic_prices():
