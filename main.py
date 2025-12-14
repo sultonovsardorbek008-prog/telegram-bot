@@ -1,3 +1,4 @@
+import os
 import logging
 import sqlite3
 import datetime
@@ -9,18 +10,18 @@ from aiogram.types import (ReplyKeyboardMarkup, KeyboardButton,
                            InlineKeyboardMarkup, InlineKeyboardButton, ReplyKeyboardRemove)
 
 # --- KONFIGURATSIYA (SOZLAMALAR) ---
-API_TOKEN = '8306384211:AAGMb0yOwnDysh6RLD-D9a84s75ik0iJw6A'
-ADMIN_ID = 8125289524 
-DB_NAME = "bot_database_v4_pro.db"
+# --- KONFIGURATSIYA (ENV ORQALI) ---
+API_TOKEN = os.getenv("BOT_TOKEN")
+ADMIN_ID = int(os.getenv("ADMIN_ID"))
 
-# VALYUTA VA TO'LOV TIZIMLARI
-CURRENCY_NAME = "SULTANCOIN"
-CURRENCY_SYMBOL = "SC"
+DB_NAME = os.getenv("DB_NAME", "bot_database_v4_pro.db")
 
-# Karta ma'lumotlari
-CARD_UZS = "5614686817322558" # Humo/Uzcard
-CARD_NAME = "SAYFULLAYEV SHERALI"
-CARD_VISA = "4176550026725055" # Visa
+CURRENCY_NAME = os.getenv("CURRENCY_NAME", "SULTANCOIN")
+CURRENCY_SYMBOL = os.getenv("CURRENCY_SYMBOL", "SC")
+
+CARD_UZS = os.getenv("CARD_UZS")
+CARD_NAME = os.getenv("CARD_NAME")
+CARD_VISA = os.getenv("CARD_VISA")
 
 logging.basicConfig(level=logging.INFO)
 bot = Bot(token=API_TOKEN)
