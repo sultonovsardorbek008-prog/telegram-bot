@@ -13,11 +13,12 @@ from aiogram.types import (ReplyKeyboardMarkup, KeyboardButton,
 # --- KONFIGURATSIYA ---
 API_TOKEN = os.getenv("BOT_TOKEN")
 ADMIN_ID = int(os.getenv("ADMIN_ID"))
-DB_NAME = os.getenv("DB_NAME", "bot_database_uzcoin_pro.db")
+# DB_NAME da Uzcoin so'zi qatnashgan, shuning uchun uni ham almashtiramiz
+DB_NAME = os.getenv("DB_NAME", "bot_database_uzcoin_pro.db").replace("uzcoin", "coin") # O'zgartirildi
 
 # REBRANDING: UzCoin
-CURRENCY_NAME = os.getenv("CURRENCY_NAME", "COIN")
-CURRENCY_SYMBOL = os.getenv("CURRENCY_SYMBOL", "COIN")
+CURRENCY_NAME = os.getenv("CURRENCY_NAME", "🪙")
+CURRENCY_SYMBOL = os.getenv("CURRENCY_SYMBOL", "🪙")
 
 # Karta ma'lumotlari (Environmentdan yoki default)
 CARD_UZS = os.getenv("CARD_UZS", "5614686817322558")
@@ -94,9 +95,9 @@ def set_config(key, value):
 # Status darajalari: 0=Start, 1=Silver, 2=Gold, 3=Platinum (Rebranding)
 STATUS_DATA = {
     0: {"name": "👤 Start", "limit": 30, "price_month": 0},
-    1: {"name": "🥈 Silver", "limit": 100, "desc": "✅ Clicker (Pul ishlash)\n✅ Limit: 100 🪙"},
-    2: {"name": "🥇 Gold", "limit": 1000, "desc": "✅ Loyihalar 50% chegirma\n✅ Limit: 1000 🪙"},
-    3: {"name": "💎 Platinum", "limit": 100000, "desc": "✅ Hammasi TEKIN (Xizmatlar ham)\n✅ Limit: 100000 🪙"}
+    1: {"name": "🥈 Silver", "limit": 100, "desc": "✅ Clicker (Pul ishlash)\n✅ Limit: 100 🪙"}, 
+    2: {"name": "🥇 Gold", "limit": 1000, "desc": "✅ Loyihalar 50% chegirma\n✅ Limit: 1000 🪙"}, 
+    3: {"name": "💎 Platinum", "limit": 100000, "desc": "✅ Hammasi TEKIN (Xizmatlar ham)\n✅ Limit: 100000 🪙"} 
 }
 
 def get_dynamic_prices():
@@ -114,12 +115,19 @@ def get_dynamic_prices():
 
 def get_coin_rates():
     return {
-        "uzs": float(get_config("rate_uzs", 1000.0)), # 1 UZC = 1000 so'm
+        "uzs": float(get_config("rate_uzs", 1000.0)), # 1 🪙 = 1000 so'm
         "usd": float(get_config("rate_usd", 0.1))
     }
 
 def get_text(key, default):
-    return get_config(f"text_{key}", default).replace("\\n", "\n")
+    # Bu yerda SultanCoin ni ham almashtiramiz
+    modified_default = default.replace("UzCoin", "🪙").replace("COIN", "🪙").replace("UZC", "🪙").replace("SultanCoin", "🪙")
+    
+    res = get_config(f"text_{key}", modified_default).replace("\\n", "\n")
+    # Bazadan olingan matndagi UzCoin, COIN, UZC, SultanCoin ni 🪙 ga almashtirish
+    res = res.replace("UzCoin", "🪙").replace("COIN", "🪙").replace("UZC", "🪙").replace("SultanCoin", "🪙")
+    return res
+
 
 def get_user_data(user_id):
     res = db_query("SELECT balance, status_level, status_expire FROM users WHERE id = ?", (user_id,), fetchone=True)
@@ -285,9 +293,9 @@ async def cb_status_shop(callback: types.CallbackQuery):
 async def show_status_menu(message: types.Message):
     prices = get_dynamic_prices()
     kb = [
-        [InlineKeyboardButton(text=f"🥈 Silver ({prices['pro_price']} UZC)", callback_data="buy_status_1")],
-        [InlineKeyboardButton(text=f"🥇 Gold ({prices['prem_price']} UZC)", callback_data="buy_status_2")],
-        [InlineKeyboardButton(text=f"💎 Platinum ({prices['king_price']} UZC)", callback_data="buy_status_3")]
+        [InlineKeyboardButton(text=f"🥈 Silver ({prices['pro_price']} 🪙)", callback_data="buy_status_1")], 
+        [InlineKeyboardButton(text=f"🥇 Gold ({prices['prem_price']} 🪙)", callback_data="buy_status_2")], 
+        [InlineKeyboardButton(text=f"💎 Platinum ({prices['king_price']} 🪙)", callback_data="buy_status_3")] 
     ]
     
     info = (f"**🌟 STATUSLAR VA IMKONIYATLAR:**\n\n"
@@ -419,9 +427,9 @@ async def buy_project_process(callback: types.CallbackQuery):
 async def services_menu(message: types.Message):
     prices = get_dynamic_prices()
     kb = [
-        [InlineKeyboardButton(text=f"🌐 Web Sayt ({prices['web']} UZC)", callback_data="serv_web")],
-        [InlineKeyboardButton(text=f"📱 Android Ilova ({prices['apk']} UZC)", callback_data="serv_apk")],
-        [InlineKeyboardButton(text=f"🤖 Telegram Bot ({prices['bot']} UZC)", callback_data="serv_bot")]
+        [InlineKeyboardButton(text=f"🌐 Web Sayt ({prices['web']} 🪙)", callback_data="serv_web")], 
+        [InlineKeyboardButton(text=f"📱 Android Ilova ({prices['apk']} 🪙)", callback_data="serv_apk")], 
+        [InlineKeyboardButton(text=f"🤖 Telegram Bot ({prices['bot']} 🪙)", callback_data="serv_bot")] 
     ]
     await message.answer("🛠 **Buyurtma turini tanlang:**\nBiz sifatli IT xizmatlarini taklif etamiz.", reply_markup=InlineKeyboardMarkup(inline_keyboard=kb))
 
@@ -486,7 +494,7 @@ async def transfer_id(message: types.Message, state: FSMContext):
     
     await message.answer(f"💰 Qancha **{CURRENCY_NAME}** o'tkazmoqchisiz?\n"
                          f"Sizning balansingiz: {format_num(user['balance'])}\n"
-                         f"O'tkazma limiti: {limit} UZC", reply_markup=cancel_kb())
+                         f"O'tkazma limiti: {limit} 🪙", reply_markup=cancel_kb())
     await state.set_state(MoneyTransfer.waiting_for_amount)
 
 @dp.message(MoneyTransfer.waiting_for_amount)
@@ -726,3 +734,4 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
+
